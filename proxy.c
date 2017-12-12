@@ -5,8 +5,7 @@
 */
 
 
-//currently working on getting ip of the requested document(hostname),  so far unsucessful.  Currently tests
-//for bad hostnames, and can talk to the browser.
+//TODO: get port out of a url, currently defaults to port 80
 
 
 #include <stdio.h>
@@ -15,6 +14,7 @@
 #include <assert.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <netdb.h>
@@ -34,6 +34,8 @@ struct httpRequest {
     char* command;
     char* document;
     char* protocol;
+    char* cleanDocument;
+    char* host;
 };
 
 
@@ -47,6 +49,7 @@ void parse_blacklist(char* file);
 void split_string(char* string, char delim, char** before, char** after);
 void *connection_handler(void *socket_desc);
 struct httpRequest parse_http(char*);
+char* send_recieve_from_server(char* ip, char* port, char* message);
 
 
 
@@ -57,6 +60,8 @@ int timeout;
 char blackIP[20][64];
 char blackHost[20][256];
 int socket_desc;
+struct keyValue *ipCache;
+struct keyValue *failedHostCache;
 
 
 int main(int argc, char **argv) {
@@ -68,7 +73,6 @@ int main(int argc, char **argv) {
     timeout = atoi(argv[2]);
     int client_sock , *new_sock;
     struct sockaddr_in server , client;
-
 
     printf("port:%d\n", port);
     printf("timeout:%d\n", timeout);
@@ -83,8 +87,6 @@ int main(int argc, char **argv) {
         printf("blackHost[%d] = %s\n", index, blackHost[index]);
         index += 1;
     }
-
-
 
     //base code from http://www.binarytides.com/server-client-example-c-sockets-linux/
     //Create socket
@@ -159,8 +161,6 @@ void parse_blacklist(char* file){
                 ipIndex += 1;
             }
             else if (!strcmp(type, "host")) {
-                item = appendString("http://", item);
-                item = appendString(item, "/");
                 strcpy(blackHost[hostIndex], item);
                 hostIndex += 1;
             }
@@ -182,10 +182,10 @@ void *connection_handler(void *socket_desc)
     int sock = *(int*)socket_desc;
     int read_size, certified;
     char *message, *user, *pass, *command, client_message[LINESIZE];
-    char* outMessage;
+    char *outMessage, *forwardIP;
     struct httpRequest request;
     int good = 1;
-
+    int blacklisted = 0;
 
     read_size = recv(sock , client_message , LINESIZE , 0);
     //printf("client_message:%s\n", client_message);
@@ -193,61 +193,88 @@ void *connection_handler(void *socket_desc)
         message = &client_message[0];
         request = parse_http(message);
     }
-    if (!strcmp(request.protocol, "HTTP/1.1")){
-        outMessage ="HTTP/1.1 ";
-    } else {
-        outMessage = "HTTP/1.0 ";
+    if (!strcmp(request.cleanDocument, "detectportal.firefox.com/success.txt")){
+        //Free the socket pointer
+    free(socket_desc);
+    close(sock);
+
+    return 0;
     }
+
+    printf("Request:%s\n", request.document);
+
+
+    outMessage = request.protocol;
+    outMessage = appendString(outMessage, " ");
+
     if (!strcmp(request.command, "GET")) {
         //Check if website is blacklisted
         int index = 0;
-        int blacklisted = 0;
         while (strcmp(blackHost[index],"")) {
-            if (!strcmp(request.document, blackHost[index])){
+            if (!strcmp(request.cleanDocument, blackHost[index])){
                 good = 0;
-                printf("document blacklisted\n");
+                blacklisted = 1;
+                printf("Host is blacklisted:%s\n", request.cleanDocument);
             }
             index += 1;
         }
-
-        //From http://beej.us/guide/bgnet/output/html/multipage/getaddrinfoman.html
-        printf("Looking up host for:%s\n", request.document);
-        struct addrinfo hints, *servinfo, *p;
-        int rv;
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_UNSPEC; // use AF_INET6 to force IPv6
-        hints.ai_socktype = SOCK_STREAM;
-        if ((rv = getaddrinfo(request.document, "http", &hints, &servinfo)) != 0) {
-            printf("getaddrinfo failed\n");
-        }
-
-        // loop through all the results and connect to the first we can
-        for(p = servinfo; p != NULL; p = p->ai_next) {
-            printf("p->ai_addr:%s\n", p->ai_addr->sa_data);
-
-            /*if ((sockfd = socket(p->ai_family, p->ai_socktype,
-                    p->ai_protocol)) == -1) {
-                perror("socket");
-                continue;
+        if (!blacklisted) {
+            //if ip not in cache
+            if ((forwardIP = return_value(&ipCache, request.cleanDocument)) == NULL){
+                struct hostent *he;
+                struct in_addr **addr_list;
+                //if it is not on the failed host cache, then try and get it
+                if (return_value(&failedHostCache, request.cleanDocument)) {
+                    good = 0;
+                    printf("%s has already failed to be found\n", request.cleanDocument);
+                } else {
+                    printf("Looking up host for:%s\n", request.cleanDocument);
+                    if ((he = gethostbyname(request.cleanDocument)) == NULL) {
+                        good = 0;
+                        printf("Failed to find host:%s\n", request.cleanDocument);
+                        add_key_value(&failedHostCache, request.cleanDocument, "");
+                    } else {
+                        addr_list = (struct in_addr **)he->h_addr_list;
+                        //printf("Official name is: %s\n", he->h_name);
+                        //printf("    IP addresses: ");
+                        for (int i = 0; addr_list[i] != NULL; i++) {
+                            forwardIP = inet_ntoa(*addr_list[i]);
+                            for (int j = 0; strcmp(blackIP[j], ""); j++) {
+                                if (!strcmp(forwardIP, blackIP[j])) {
+                                    good = 0;
+                                    blacklisted = 1;
+                                    printf("Ip is blacklisted:%s\n", forwardIP);
+                                }
+                            }
+                        }
+                        if (!blacklisted) {
+                            add_key_value(&ipCache, request.cleanDocument, forwardIP);
+                        }
+                    }
+                }
+            } else {
+                //ip is in cache
+                printf("ip in cache:%s\n", forwardIP);
             }
+        }
+        if(good){
+            //TODO: need to implement the request forwarding
+            char* serverResponse = send_recieve_from_server(forwardIP, "80", message);
 
-            if (connect(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
-                perror("connect");
-                close(sockfd);
-                continue;
-            }*/
+            //need to implement error checking here, currently everything connect to fails
+            printf("%s||\n%s\n||\n", request.cleanDocument, serverResponse);
 
-            break; // if we get here, we must have connected successfully
+
         }
 
-        if (p == NULL) {
-            // looped off the end of the list with no connection
-            fprintf(stderr, "failed to connect\n");
-            exit(2);
-        }
-
-        freeaddrinfo(servinfo); // all done with this structure
-
+        //if host not blacklisted
+        // check cache
+        // if not cache, get hostbyname
+        //  check ip for blacklist
+        //  if not blacklist
+        //   add pair to cache
+        // else
+        //  return ip
     }
     else {
         good = 0;
@@ -256,12 +283,15 @@ void *connection_handler(void *socket_desc)
     if (good) {
         outMessage = appendString(outMessage, "200 Document Follows\n\n<html><body>Good</body></html>");
     } else {
-        outMessage = appendString(outMessage, "400 bad request\n\n<html><body>Bad</body></html>");
+        if (blacklisted) {
+            outMessage = "ERROR 403 Forbidden";
+        } else {
+            outMessage = "ERROR 400 bad request";
+        }
     }
 
-    printf("RESPONSE:%s\n", outMessage);
+    printf("%s RESPONSE:%s\n", request.cleanDocument, outMessage);
     write(sock , outMessage, strlen(outMessage));
-
 
     //Free the socket pointer
     free(socket_desc);
@@ -273,20 +303,81 @@ void *connection_handler(void *socket_desc)
 
 struct httpRequest parse_http(char* http) {
     struct httpRequest h;
-    char *command, *document, *protocol, *firstLine, *contents;
+    char *command, *document, *protocol, *firstLine, *contents, *cleanDocument, *host;
 
     split_string(http, '\n', &firstLine, &contents);
-    printf("firstLine:%s\n", firstLine);
     //printf("contents:%s\n", contents);
     split_string(firstLine, ' ', &command, &firstLine);
     split_string(firstLine, ' ', &document, &protocol);
     h.command = command;
     h.document = document;
     h.protocol = protocol;
-    //printf("request.command:%s\n", command);
-    //printf("request.document:%s\n", document);
-    //printf("request.protocol:%s\n", protocol);
+    cleanDocument = document;
+    char maybeHttp[8];
+    memcpy(maybeHttp, &cleanDocument[0], 7);
+    maybeHttp[7] = '\0';
+    if (!strcmp(maybeHttp, "http://")){
+        cleanDocument = cleanDocument + 7;
+    }
+    char maybeWWWdot[5];
+    memcpy(maybeWWWdot, &cleanDocument[0], 4);
+    maybeWWWdot[4] = '\0';
+    if (!strcmp(maybeWWWdot, "www.")){
+        cleanDocument = cleanDocument + 4;
+    }
+    char maybeSlash[2];
+    memcpy(maybeSlash, &cleanDocument[strlen(cleanDocument)-1], 1);
+    maybeSlash[1] = '\0';
+    if (!strcmp(maybeSlash, "/")){
+        cleanDocument[strlen(cleanDocument)-1] = '\0';
+    }
+    h.cleanDocument = cleanDocument;
+    //need to clean the document in order to get the host.  http://google.com/ does not work
+    //but google.com does.  Also simplifies the blacklisting
     return h;
+}
+
+
+char* send_recieve_from_server(char* ipStr, char* port, char* message) {
+    //could change this to retun "" if something goes wrong, and print out the error
+    //to aid in error checking in final program
+    int sock;
+    struct sockaddr_in server;
+    sock = socket(AF_INET , SOCK_STREAM , 0);
+    if (sock == -1) {
+        printf("Could not create socket");
+        return "";
+    }
+    server.sin_addr.s_addr = inet_addr(ipStr);
+    server.sin_family = AF_INET;
+    server.sin_port = htons( atoi(port) );
+
+    //Connect to remote server
+    if (connect(sock , (struct sockaddr *)&server , sizeof(server)) < 0) {
+        //printf("connect failed. Error\n");
+        char* errorMessage = "connect to ";
+        errorMessage = appendString(errorMessage, ipStr);
+        errorMessage = appendString(errorMessage, " failed.");
+        return errorMessage;
+    }
+    printf("%s connection successful\n", ipStr);
+    if( write(sock , message , strlen(message)) < 0) {
+        printf("Send failed\n");
+        return "";
+    }
+    char* serverReply = "";
+    int read;
+    char fromServer[256];
+    bzero(fromServer, sizeof(fromServer));
+    while((read = recv(sock, fromServer, sizeof(fromServer), 0)) != 0) {
+        serverReply = appendString(serverReply, fromServer);
+        printf("ServerFrom:%s\n", fromServer);
+        bzero(fromServer, sizeof(fromServer));
+    }
+
+    close(sock);
+
+    return serverReply;
 }
 
 
@@ -360,7 +451,7 @@ char* return_value(struct keyValue **hash, char* key) {
         strcpy(copy, f->value);
         return copy;
     } else {
-        return "";
+        return NULL;
     }
 }
 
