@@ -18,10 +18,14 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <netdb.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <time.h>
 
 #include "uthash.h"
 
 #define LINESIZE 2048
+#define BUFSIZE 419200
 
 
 //Structs
@@ -35,7 +39,7 @@ struct httpRequest {
     char* document;
     char* protocol;
     char* cleanDocument;
-    char* host;
+    int port;
 };
 
 
@@ -49,7 +53,10 @@ void parse_blacklist(char* file);
 void split_string(char* string, char delim, char** before, char** after);
 void *connection_handler(void *socket_desc);
 struct httpRequest parse_http(char*);
-char* send_recieve_from_server(char* ip, char* port, char* message);
+char* send_recieve_from_server(char* ip, int port, char* message);
+void update_file_cache_dict(long int time);
+void add_to_file_cache_dict(char *name, long int time);
+void clear_hash(struct keyValue **hash);
 
 
 
@@ -62,6 +69,9 @@ char blackHost[20][256];
 int socket_desc;
 struct keyValue *ipCache;
 struct keyValue *failedHostCache;
+struct keyValue *fileCache;
+char *msg[BUFSIZE];
+
 
 
 int main(int argc, char **argv) {
@@ -87,6 +97,20 @@ int main(int argc, char **argv) {
         printf("blackHost[%d] = %s\n", index, blackHost[index]);
         index += 1;
     }
+    printf("\n\n");
+
+
+    //Test section
+
+
+    //TODO: Does not work
+    /*struct httpRequest hat = parse_http("GET test.com:400/index.html");
+    printf("document:|%s|\n", hat.document);
+    printf("cleanDocument:|%s|\n", hat.cleanDocument);
+    printf("port:|%d|\n", hat.port);*/
+
+
+
 
     //base code from http://www.binarytides.com/server-client-example-c-sockets-linux/
     //Create socket
@@ -186,13 +210,16 @@ void *connection_handler(void *socket_desc)
     struct httpRequest request;
     int good = 1;
     int blacklisted = 0;
+    char* serverResponse;
 
     read_size = recv(sock , client_message , LINESIZE , 0);
     //printf("client_message:%s\n", client_message);
     if (read_size > 0){
         message = &client_message[0];
+        //printf("MESSAGE:|%s|\n", message);
         request = parse_http(message);
     }
+    message = appendString(message, "\n\n");
     if (!strcmp(request.cleanDocument, "detectportal.firefox.com/success.txt")){
         //Free the socket pointer
     free(socket_desc);
@@ -201,7 +228,7 @@ void *connection_handler(void *socket_desc)
     return 0;
     }
 
-    printf("Request:%s\n", request.document);
+    //printf("Request:%s | %s\n",request.command, request.document);
 
 
     outMessage = request.protocol;
@@ -258,30 +285,79 @@ void *connection_handler(void *socket_desc)
             }
         }
         if(good){
+            //If we want to check full cache every time: Keeps it cleaner, but costs more time
+            //Build local dict of locally cached files
+            //  for file in cache directory
+            //    Check that they are within timeout, else delete them
+            //    Add files to local dict
+            //  Check dict for wanted documents
+            //  Return wanted doc or try to get document
+
+            //If we want to only check this document
+            //Look through all files in cache directory
+            //  if its name matches the wanted document
+            //    check if it has past its timeout
+            //      if it has, delete it, otherwise return it.
+            time_t currentTime = time(NULL);
+            //create directory if it doesn't exist
+            int resultOfMkdir = mkdir("./cache", 0777);
+            //List all files and subdirectorys into fileCache
+            update_file_cache_dict(currentTime);
+            //printf("print_hash\n");
+            //print_hash(&fileCache,1);
+            //printf("print_hash\n");
+            //Check if fileCache has what we want
+            char* path = return_value(&fileCache, request.cleanDocument);
+            if (path != NULL) {
+                //rintf("retrieve cachePath, need to find actual file:%s\n", path);
+                FILE * file = fopen(path, "rb");
+                bzero(msg, BUFSIZE);
+                int n;
+                while ((n = fread(msg, 1, sizeof(msg), file)) > 0){
+                    write(sock, msg, n);
+                    bzero(msg, BUFSIZE);
+                }
+
+            } else {
+                printf("Document not in cache\n");
+            }
+
+
             //TODO: need to implement the request forwarding
-            char* serverResponse = send_recieve_from_server(forwardIP, "80", message);
+            serverResponse = send_recieve_from_server(forwardIP, request.port, message);
 
             //need to implement error checking here, currently everything connect to fails
-            printf("%s||\n%s\n||\n", request.cleanDocument, serverResponse);
+            if (!strcmp(serverResponse, "")) {
+                printf("Send Recieve to %s:%d failed\n", request.cleanDocument, request.port);
+                good = 0;
+            } else {
+                char timeStr[32];
+                sprintf(timeStr, "%ld", currentTime);
+                char* cachePath = appendString("cache/", request.cleanDocument);
+                //printf("cachePath:%s*\n", cachePath);
+                popen(appendString("rm -rf ", appendString(cachePath, "*")), "r");
+                cachePath = appendString(cachePath, ".");
+                cachePath = appendString(cachePath, &timeStr[0]);
+                //printf("saving cachePath:%s\n", cachePath);
+
+                FILE *fp;
+                fp = fopen(cachePath, "w+");
+                fputs(serverResponse, fp);
+                fclose(fp);
+
+                //printf("%s||\n%s\n||\n", request.cleanDocument, serverResponse);
+            }
 
 
         }
-
-        //if host not blacklisted
-        // check cache
-        // if not cache, get hostbyname
-        //  check ip for blacklist
-        //  if not blacklist
-        //   add pair to cache
-        // else
-        //  return ip
     }
     else {
         good = 0;
+        //printf("not get\n");
     }
 
     if (good) {
-        outMessage = appendString(outMessage, "200 Document Follows\n\n<html><body>Good</body></html>");
+        outMessage = serverResponse;
     } else {
         if (blacklisted) {
             outMessage = "ERROR 403 Forbidden";
@@ -290,7 +366,7 @@ void *connection_handler(void *socket_desc)
         }
     }
 
-    printf("%s RESPONSE:%s\n", request.cleanDocument, outMessage);
+    printf("REQUEST:\n||\n%s\n||\nRESPONSE:\n||\n%s||\n", message, outMessage);
     write(sock , outMessage, strlen(outMessage));
 
     //Free the socket pointer
@@ -302,8 +378,11 @@ void *connection_handler(void *socket_desc)
 }
 
 struct httpRequest parse_http(char* http) {
+    //May need to handle test:400/index.html?
+
+
     struct httpRequest h;
-    char *command, *document, *protocol, *firstLine, *contents, *cleanDocument, *host;
+    char *command, *document, *protocol, *firstLine, *contents, *cleanDocument;
 
     split_string(http, '\n', &firstLine, &contents);
     //printf("contents:%s\n", contents);
@@ -312,12 +391,25 @@ struct httpRequest parse_http(char* http) {
     h.command = command;
     h.document = document;
     h.protocol = protocol;
+    h.port = 80;
+    h.cleanDocument = NULL;
     cleanDocument = document;
+    char maybeSlash[2];
+    memcpy(maybeSlash, &cleanDocument[strlen(cleanDocument)-1], 1);
+    maybeSlash[1] = '\0';
+    if (!strcmp(maybeSlash, "/")){
+        cleanDocument[strlen(cleanDocument)-1] = '\0';
+    }
     char maybeHttp[8];
     memcpy(maybeHttp, &cleanDocument[0], 7);
     maybeHttp[7] = '\0';
     if (!strcmp(maybeHttp, "http://")){
         cleanDocument = cleanDocument + 7;
+    }
+    char* maybePort;
+    split_string(cleanDocument, ':', &cleanDocument, &maybePort);
+    if (maybePort != NULL) {
+        h.port = atoi(maybePort);
     }
     char maybeWWWdot[5];
     memcpy(maybeWWWdot, &cleanDocument[0], 4);
@@ -325,57 +417,60 @@ struct httpRequest parse_http(char* http) {
     if (!strcmp(maybeWWWdot, "www.")){
         cleanDocument = cleanDocument + 4;
     }
-    char maybeSlash[2];
-    memcpy(maybeSlash, &cleanDocument[strlen(cleanDocument)-1], 1);
-    maybeSlash[1] = '\0';
-    if (!strcmp(maybeSlash, "/")){
-        cleanDocument[strlen(cleanDocument)-1] = '\0';
-    }
+
+
     h.cleanDocument = cleanDocument;
-    //need to clean the document in order to get the host.  http://google.com/ does not work
-    //but google.com does.  Also simplifies the blacklisting
     return h;
 }
 
 
-char* send_recieve_from_server(char* ipStr, char* port, char* message) {
+char* send_recieve_from_server(char* ipStr, int port, char* message) {
     //could change this to retun "" if something goes wrong, and print out the error
     //to aid in error checking in final program
-    int sock;
+    int connfd;
     struct sockaddr_in server;
-    sock = socket(AF_INET , SOCK_STREAM , 0);
-    if (sock == -1) {
+    connfd = socket(AF_INET , SOCK_STREAM , 0);
+    if (connfd == -1) {
         printf("Could not create socket");
         return "";
     }
     server.sin_addr.s_addr = inet_addr(ipStr);
     server.sin_family = AF_INET;
-    server.sin_port = htons( atoi(port) );
+    server.sin_port = htons( port );
+    //printf("ip:%s port:%d\n", ipStr, port);
 
     //Connect to remote server
-    if (connect(sock , (struct sockaddr *)&server , sizeof(server)) < 0) {
+    if (connect(connfd , (struct sockaddr *)&server , sizeof(server)) < 0) {
         //printf("connect failed. Error\n");
         char* errorMessage = "connect to ";
         errorMessage = appendString(errorMessage, ipStr);
         errorMessage = appendString(errorMessage, " failed.");
-        return errorMessage;
+        printf("%s\n", errorMessage);
+        return "";
     }
-    printf("%s connection successful\n", ipStr);
-    if( write(sock , message , strlen(message)) < 0) {
+    printf("%s:%d connection successful\n", ipStr, port);
+    //printf("MESSAGETOSEND:\n|%s|\n", message);
+    if( send(connfd , message , strlen(message),0) < 0) {
         printf("Send failed\n");
         return "";
     }
+    //printf("Send complete\n");
+
     char* serverReply = "";
-    int read;
+    int m, index;
     char fromServer[256];
     bzero(fromServer, sizeof(fromServer));
-    while((read = recv(sock, fromServer, sizeof(fromServer), 0)) != 0) {
+    send(connfd , message , strlen(message),0);
+    //printf("after send, before while\n");
+    while((m = recv(connfd, fromServer, sizeof(fromServer), 0)) == 256) {
         serverReply = appendString(serverReply, fromServer);
-        printf("ServerFrom:%s\n", fromServer);
+        //printf("SERVERFROM: m=%d i=%d:|%s|\n\n", m, index, fromServer);
         bzero(fromServer, sizeof(fromServer));
     }
+    serverReply = appendString(serverReply, "\n");
+    //printf("SERVERREPLY:||%s||\n", serverReply);
 
-    close(sock);
+    close(connfd);
 
     return serverReply;
 }
@@ -383,17 +478,101 @@ char* send_recieve_from_server(char* ipStr, char* port, char* message) {
 
 
 //helper functions
+void update_file_cache_dict(long int time) {
+    //need to run different version for top level cache directory
+    clear_hash(&fileCache);
+    DIR *dir;
+    struct dirent *entry;
+
+    if (!(dir = opendir("cache")))
+        return;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            char path[1024];
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+                continue;
+            snprintf(path, sizeof(path), "%s/%s", "cache", entry->d_name);
+            add_to_file_cache_dict(path, time);
+        } else {
+            char* path = appendString("cache/", entry->d_name);
+            char* dotAt = strrchr(entry->d_name, '.');
+            *dotAt = '\0';
+            long int timeSinceCached = time-atol(dotAt+1);
+            if (timeout >= timeSinceCached) {
+                //printf("%s: File is good on timeout\n", entry->d_name);
+                add_key_value(&fileCache, entry->d_name, path);
+            } else {
+                //printf("%s: File is bad on timeout\n", entry->d_name);
+                //printf("to delete:%s\n", entry->d_name);
+                remove(entry->d_name);
+            }
+        }
+    }
+    closedir(dir);
+}
+
+
+void add_to_file_cache_dict(char *name, long int time)
+{
+    DIR *dir;
+    struct dirent *entry;
+
+    if (!(dir = opendir(name)))
+        return;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            char path[1024];
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+                continue;
+            snprintf(path, sizeof(path), "%s/%s", name, entry->d_name);
+            add_to_file_cache_dict(path, time);
+        } else {
+            char* path = appendString("cache/", entry->d_name);
+            char* dotAt = strrchr(entry->d_name, '.');
+            *dotAt = '\0';
+            long int timeSinceCached = time-atol(dotAt+1);
+            if (timeout >= timeSinceCached) {
+                //printf("%s: File is good on timeout\n", entry->d_name);
+                char* fileWOCache = name + 6;
+                fileWOCache = appendString(fileWOCache, "/");
+                fileWOCache = appendString(fileWOCache, entry->d_name);
+                add_key_value(&fileCache, fileWOCache, path);
+            } else {
+                //printf("%s: File is bad on timeout\n", entry->d_name);
+                char* cachePath = name;
+                cachePath = appendString(cachePath, "/");
+                cachePath = appendString(cachePath, entry->d_name);
+                //printf("to delete:%s\n", cachePath);
+                remove(cachePath);
+            }
+        }
+    }
+    closedir(dir);
+}
+
+
+
 void split_string(char* string, char delim, char** before, char** after) {
     assert(before);
     assert(after);
 
     *after = strchr(string, delim);
-    size_t lengthOfFirst = *after - string;
-    *before = (char*)malloc((lengthOfFirst + 1)*sizeof(char));
-    strncpy(*before, string, lengthOfFirst);
-    *after = *after+1;
-    trimwhitespace(*before);
-    trimwhitespace(*after);
+
+    if (*after == NULL) {
+        //printf("|%c| after is NULL\n", delim);
+        *before = string;
+    } else {
+        //printf("|%c| after is not NULL\n", delim);
+
+        size_t lengthOfFirst = *after - string;
+        *before = (char*)malloc((lengthOfFirst + 1)*sizeof(char));
+        strncpy(*before, string, lengthOfFirst);
+        *after = *after+1;
+        trimwhitespace(*before);
+        trimwhitespace(*after);
+    }
 }
 
 
@@ -464,4 +643,13 @@ void print_hash(struct keyValue **hash, int showKeyValue) {
             printf("%s %s\n", s->key, s->value);
         }
     }
+}
+
+void clear_hash(struct keyValue **hash) {
+  struct keyValue *current_user, *tmp;
+
+  HASH_ITER(hh, *hash, current_user, tmp) {
+    HASH_DEL(*hash,current_user);  /* delete; users advances to next */
+    free(current_user);            /* optional- if you want to free  */
+  }
 }
